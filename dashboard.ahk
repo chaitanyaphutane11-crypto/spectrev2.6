@@ -22,63 +22,13 @@ SanitizeOffset(offset) {
     return offset
 }
 
-; Convert string to hex (with padding)
 Spectre_Gadget(val, attackType) {
     hexVal := ""
-    Loop StrLen(val) {
-        ch := SubStr(val, A_Index, 1)
-        hexVal .= Format("{:02X}00", Ord(ch))
-    }
+    Loop StrLen(val)
+        hexVal .= Format("{:02X}00", Ord(SubStr(val, A_Index, 1)))
     RegWrite(hexVal, "REG_BINARY", Reg_Path, attackType . "_Leak")
     LogToCSV(attackType, val, "Registry_Injected")
-
-    ; Show lookup in all bases
-    MsgBox LookupBases(val, hexVal, attackType)
 }
-
-; Convert hex back to string
-HexToString(hexVal) {
-    result := ""
-    Loop StrLen(hexVal)//4 {
-        pos := (A_Index-1)*4 + 1
-        hexPair := SubStr(hexVal, pos, 2)
-        result .= Chr("0x" . hexPair)
-    }
-    return result
-}
-
-; Lookup helper: show hex, decimal, octal for each char
-LookupBases(val, hexVal := "", attackType := "") {
-    out := "AttackType: " attackType "`n"
-    out .= "Original String: " val "`n"
-    out .= "Hex (padded): " hexVal "`n`n"
-
-    ; Forward lookup
-    out .= "--- Forward Lookup ---`n"
-    Loop StrLen(val) {
-        ch := SubStr(val, A_Index, 1)
-        code := Ord(ch)
-        out .= Format(
-            "Char: {1} | Hex: 0x{2:X} | Dec: {2} | Oct: 0o{2:o}`n",
-            ch, code
-        )
-    }
-
-    ; Reverse lookup
-    out .= "`n--- Reverse Lookup ---`n"
-    rev := HexToString(hexVal)
-    Loop StrLen(rev) {
-        ch := SubStr(rev, A_Index, 1)
-        code := Ord(ch)
-        out .= Format(
-            "Char: {1} | Hex: 0x{2:X} | Dec: {2} | Oct: 0o{2:o}`n",
-            ch, code
-        )
-    }
-
-    return out
-}
-
 
 Execute_V1() {
     Predictor_State := 3
@@ -191,12 +141,13 @@ RunMemScan() {
                     endNum   := match.End
 
                     if (base = "Dec") {
-                        startStr := startNum
-                        endStr   := endNum
+                        startStr := Format("{:d}", startNum)
+                        endStr   := Format("{:d}", endNum)
                     } else if (base = "Oct") {
-                        startStr := Format("0o{:o}", startNum)
-                        endStr   := Format("0o{:o}", endNum)
-                    } else {
+                        ; Octal padded to 8 digits
+                        startStr := Format("{:08o}", startNum)
+                        endStr   := Format("{:08o}", endNum)
+                    } else { ; Hex
                         startStr := Format("0x{:X}", startNum)
                         endStr   := Format("0x{:X}", endNum)
                     }
@@ -213,6 +164,8 @@ RunMemScan() {
     }
     UpdateStatusBar()
 }
+
+
 
 
 ShowInHxD(LV, row) {
@@ -235,53 +188,68 @@ ShowInHxD(LV, row) {
         startStr := Trim(parts[1])
         endStr   := Trim(parts[2])
 
-        ; Convert to numbers
-        if (SubStr(startStr,1,2) = "0x")
-            startNum := Integer(startStr)
-        else if (SubStr(startStr,1,2) = "0o")
-            startNum := Integer("0" . SubStr(startStr,3))
-        else
-            startNum := Integer(startStr)
+        ; Convert back to numbers safely
+        if (SubStr(startStr,1,2) = "0x") {
+            startNum := Integer(startStr)   ; hex string
+        } else if RegExMatch(startStr, "^[0-7]+$") {
+            startNum := StrToInt(startStr, 8) ; octal string
+        } else {
+            startNum := Integer(startStr)   ; decimal
+        }
 
-        if (SubStr(endStr,1,2) = "0x")
+        if (SubStr(endStr,1,2) = "0x") {
             endNum := Integer(endStr)
-        else if (SubStr(endStr,1,2) = "0o")
-            endNum := Integer("0" . SubStr(endStr,3))
-        else
+        } else if RegExMatch(endStr, "^[0-7]+$") {
+            endNum := StrToInt(endStr, 8)
+        } else {
             endNum := Integer(endStr)
+        }
 
-        ; Jump to start offset (plain hex digits)
+        base := BaseDropdown.Text
+
+        ; Jump to start offset
         Send "^g"
         Sleep 200
-        Send Format("{:X}", startNum) "{Enter}"
+        if (base = "Dec") {
+            Send Format("{:d}", startNum) "{Enter}"
+        } else if (base = "Oct") {
+            Send Format("{:08o}", startNum) "{Enter}"
+        } else {
+            Send Format("{:X}", startNum) "{Enter}"
+        }
 
-        ; Jump to end offset (plain hex digits)
+        ; Jump to end offset
         Sleep 500
         Send "^g"
         Sleep 200
-        Send Format("{:X}", endNum) "{Enter}"
+        if (base = "Dec") {
+            Send Format("{:d}", endNum) "{Enter}"
+        } else if (base = "Oct") {
+            Send Format("{:08o}", endNum) "{Enter}"
+        } else {
+            Send Format("{:X}", endNum) "{Enter}"
+        }
 
         ; Highlight the range
         bytesToSelect := endNum - startNum + 1
-        ; Move caret one byte to the right first
         Send "{Right}"
         Sleep 100
-
-        ; Now select leftward for the full range
         Loop bytesToSelect {
             Send "+{Left}"
             Sleep 30
         }
-        ; Pause for confirmation before continuing
-        MsgBox "Range " startStr " - " endStr " highlighted. Press OK to continue."
+
+        MsgBox "Range highlighted:`nDec: " startNum " - " endNum
+            . "`nHex: 0x" Format("{:X}", startNum) " - 0x" Format("{:X}", endNum)
+            . "`nOct: " Format("{:08o}", startNum) " - " Format("{:08o}", endNum)
     }
 }
 
-
-
-
-
-
+; Helper function for octal parsing
+StrToInt(str, base := 10) {
+    ; Convert string in given base to integer
+    return DllCall("msvcrt\strtol", "str", str, "ptr", 0, "int", base, "int")
+}
 
 
 LogToCSV(Action, Word, Status, Offset := "N/A") {
