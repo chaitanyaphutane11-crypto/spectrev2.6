@@ -67,6 +67,30 @@ FindEditControl(LV, word := "DATA") {
 }
 
 ; --- Scan Notepad using the control found above ---
+; Helper: safely parse string into integer
+ParseInteger(str) {
+    ; If empty string, return 0 to avoid error
+    if (str = "")
+        return 0
+
+    ; Handle hex with 0x prefix
+    if (SubStr(str,1,2) = "0x") {
+        return Integer(str) ; hex
+    }
+    ; Handle pure octal digits (0–7 only)
+    else if RegExMatch(str, "^[0-7]+$") {
+        value := 0
+        for i, ch in StrSplit(str) {
+            value := value * 8 + (Ord(ch) - 48)
+        }
+        return value
+    }
+    ; Otherwise decimal
+    else {
+        return Integer(str)
+    }
+}
+
 ScanNotepad(Terms, stepSize, LV) {
     results := []
     hwnd := WinExist("ahk_exe notepad.exe")
@@ -76,52 +100,46 @@ ScanNotepad(Terms, stepSize, LV) {
     }
 
     for term in Terms {
-        editCtrl := FindEditControl(LV, term)
-        if !editCtrl {
-            results.Push({Word: term, Address: "NOT_FOUND", File: ""})
-            continue
-        }
-
-        buf := FileRead(editCtrl.FileName, "RAW")
-
-        needle := Buffer(StrLen(term))
-        for i, char in StrSplit(term) {
-            NumPut("UChar", Ord(char), needle, i-1)
-        }
-
-        haySize := buf.Size
-        ndlSize := needle.Size
-        matches := []
-
-        Loop haySize - ndlSize + 1 {
-            offset := A_Index - 1
-            match := true
-
-            Loop ndlSize {
-                j := A_Index - 1
-                if NumGet(buf, offset+j, "UChar") != NumGet(needle, j, "UChar") {
-                    match := false
-                    break
-                }
-            }
-
-            if match {
-                startOffset := offset
-                endOffset   := offset + ndlSize - 1
-                ; Store as numbers
-                matches.Push({Start: startOffset, End: endOffset})
-            }
-        }
-
-        if matches.Length {
-            results.Push({Word: term, Address: matches, File: editCtrl.FileName})
-        } else {
-            results.Push({Word: term, Address: "NOT_FOUND", File: editCtrl.FileName})
-        }
+    editCtrl := FindEditControl(LV, term)
+    if !editCtrl {
+        results.Push({Word: term, Address: "NOT_FOUND", File: ""})
+        continue
     }
-    return results
+
+    ; Try UTF-8 first, fallback to UTF-16
+    bufStr := FileRead(editCtrl.FileName, "UTF-8")
+    if !InStr(bufStr, term, true)
+        bufStr := FileRead(editCtrl.FileName, "UTF-16")
+
+    matches := []
+    pos := 1
+    charSize := (InStr(bufStr, term, true) ? 1 : 2)
+
+    while (pos := InStr(bufStr, term, true, pos)) {
+        startOffset := (pos - 1) * charSize - 2
+        endOffset   := startOffset + (StrLen(term) * charSize)
+        ;- 1
+        matches.Push({Start: startOffset, End: endOffset})
+        pos := pos + 1
+    }
+
+    ; Adjust the final match only
+    if (matches.Length > 0) {
+        last := matches.Length
+        matches[last].Start += 3 + charSize
+        matches[last].End += 3
+    }
+
+    if matches.Length {
+        results.Push({Word: term, Address: matches, File: editCtrl.FileName})
+    } else {
+        results.Push({Word: term, Address: "NOT_FOUND", File: editCtrl.FileName})
+    }
 }
 
+
+    return results
+}
 
 RunMemScan() {
     Terms := StrSplit(TermsBox.Value, ",")
@@ -131,47 +149,56 @@ RunMemScan() {
 
     if IsObject(Results) {
         for item in Results {
+            base := BaseDropdown.Text
             offsetStr := ""
+            lengthStr := ""
+
             if (item.Address != "NOT_FOUND") {
-                base := BaseDropdown.Text
                 count := 0
                 for match in item.Address {
                     count++
                     startNum := match.Start
                     endNum   := match.End
-
+                    length   := endNum - startNum + 1
+                    startNum += length
+                    endNum += length
+                    ; Format offsets for display only
                     if (base = "Dec") {
                         startStr := Format("{:d}", startNum)
                         endStr   := Format("{:d}", endNum)
                     } else if (base = "Oct") {
-                        ; Octal padded to 8 digits
-                        startStr := Format("{:08o}", startNum)
-                        endStr   := Format("{:08o}", endNum)
+                        ; Correct octal formatting
+                        startStr := Format("{:o}", startNum)
+                        endStr   := Format("{:o}", endNum)
                     } else { ; Hex
                         startStr := Format("0x{:X}", startNum)
                         endStr   := Format("0x{:X}", endNum)
                     }
 
-                    if (count > 1)
+                    if (count > 1) {
                         offsetStr .= ", "
-                    offsetStr .= Format("{1} - {2}", startStr, endStr)
+                        lengthStr .= ", "
+                    }
+                    offsetStr .= Format("{1}-{2}", startStr, endStr)
+                    lengthStr := length " bytes"
                 }
             } else {
                 offsetStr := "NOT_FOUND"
+                lengthStr := ""
             }
-            ScanLV.Add(, item.Word, offsetStr, item.File)
+
+            ScanLV.Add(, item.Word, offsetStr, item.File, lengthStr)
         }
     }
     UpdateStatusBar()
 }
 
 
-
-
 ShowInHxD(LV, row) {
     word   := LV.GetText(row, 1)
     offset := LV.GetText(row, 2)
     file   := LV.GetText(row, 3)
+    length := LV.GetText(row, 4)
 
     ranges := StrSplit(offset, ",")
 
@@ -187,33 +214,19 @@ ShowInHxD(LV, row) {
 
         startStr := Trim(parts[1])
         endStr   := Trim(parts[2])
+        base     := BaseDropdown.Text
 
-        ; Convert back to numbers safely
-        if (SubStr(startStr,1,2) = "0x") {
-            startNum := Integer(startStr)   ; hex string
-        } else if RegExMatch(startStr, "^[0-7]+$") {
-            startNum := StrToInt(startStr, 8) ; octal string
-        } else {
-            startNum := Integer(startStr)   ; decimal
-        }
-
-        if (SubStr(endStr,1,2) = "0x") {
-            endNum := Integer(endStr)
-        } else if RegExMatch(endStr, "^[0-7]+$") {
-            endNum := StrToInt(endStr, 8)
-        } else {
-            endNum := Integer(endStr)
-        }
-
-        base := BaseDropdown.Text
-
+        startNum := ParseInteger(startStr)
+        endNum   := ParseInteger(endStr)
+        startNum -= ParseInteger(StrReplace(length, " bytes"))
+        endNum -= ParseInteger(StrReplace(length, " bytes"))
         ; Jump to start offset
         Send "^g"
         Sleep 200
         if (base = "Dec") {
             Send Format("{:d}", startNum) "{Enter}"
         } else if (base = "Oct") {
-            Send Format("{:08o}", startNum) "{Enter}"
+            Send Format("{:o}", startNum) "{Enter}"
         } else {
             Send Format("{:X}", startNum) "{Enter}"
         }
@@ -225,25 +238,29 @@ ShowInHxD(LV, row) {
         if (base = "Dec") {
             Send Format("{:d}", endNum) "{Enter}"
         } else if (base = "Oct") {
-            Send Format("{:08o}", endNum) "{Enter}"
+            Send Format("{:o}", endNum) "{Enter}"
         } else {
             Send Format("{:X}", endNum) "{Enter}"
         }
 
         ; Highlight the range
-        bytesToSelect := endNum - startNum + 1
-        Send "{Right}"
-        Sleep 100
+        bytesToSelect := ParseInteger(StrReplace(length, " bytes"))
         Loop bytesToSelect {
-            Send "+{Left}"
+            Send "+{Right}"
             Sleep 30
         }
-
-        MsgBox "Range highlighted:`nDec: " startNum " - " endNum
-            . "`nHex: 0x" Format("{:X}", startNum) " - 0x" Format("{:X}", endNum)
-            . "`nOct: " Format("{:08o}", startNum) " - " Format("{:08o}", endNum)
+        startNum += ParseInteger(StrReplace(length, " bytes"))
+        endNum += ParseInteger(StrReplace(length, " bytes"))
+        ; Confirmation
+        MsgBox "Highlighted " word " at range:`n"
+            . "Dec: " startNum " - " endNum "`n"
+            . "Hex: 0x" Format("{:X}", startNum) " - 0x" Format("{:X}", endNum) "`n"
+            . "Oct: " Format("{:08o}", startNum) " - " Format("{:08o}", endNum) "`n`n"
+            . "Length: " bytesToSelect " bytes`n`n"
+            . "Press OK to continue to next match."
     }
 }
+
 
 ; Helper function for octal parsing
 StrToInt(str, base := 10) {
@@ -294,7 +311,7 @@ MainGui.Add("Text", "xp+20 yp+30", "Terms to Find (comma-separated):")
 TermsBox := MainGui.Add("Edit", "w380 r1", "DATA,V1_BOUNDS_BYPASS")
 BtnScan := MainGui.Add("Button", "w380 h30", "Scan Notepad Memory")
 ; Add three columns to your ListView: Word, Address, File
-ScanLV := MainGui.Add("ListView", "w400 h90", ["Word","Address","File"])
+ScanLV := MainGui.Add("ListView", "w400 h90", ["Word","Address","File","Length"])
 
 ; Double‑click handler
 ScanLV.OnEvent("DoubleClick", ShowInHxD)
