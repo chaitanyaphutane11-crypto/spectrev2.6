@@ -11,6 +11,9 @@ Global Secret_Array := []
 Global Virtual_Cache := Map()
 Global LastAnalysis := ""
 
+; Now you can safely push values
+Secret_Array.Push("DATA")
+Secret_Array.Push("V1_BOUNDS_BYPASS")
 if !FileExist(Log_File)
     FileAppend("Timestamp,Action,Word,Status,MemoryOffset`n", Log_File, "UTF-8")
 
@@ -24,23 +27,73 @@ SanitizeOffset(offset) {
 
 Spectre_Gadget(val, attackType) {
     hexVal := ""
-    Loop StrLen(val)
-        hexVal .= Format("{:02X}00", Ord(SubStr(val, A_Index, 1)))
+    ; Convert each character to UTF-16LE hex (two bytes per char)
+    Loop StrLen(val) {
+        ch := SubStr(val, A_Index, 1)
+        hexVal .= Format("{:02X}00", Ord(ch))
+    }
+
+    ; Write as REG_BINARY
     RegWrite(hexVal, "REG_BINARY", Reg_Path, attackType . "_Leak")
+
+    ; Log the injection
     LogToCSV(attackType, val, "Registry_Injected")
+
+    ; Show a MsgBox with the key name depending on variant
+    if (attackType = "Variant1") {
+        MsgBox "Spectre Variant 1 key injected:`n" Reg_Path "\" attackType "_Leak"
+    } else if (attackType = "Variant2") {
+        MsgBox "Spectre Variant 2 key injected:`n" Reg_Path "\" attackType "_Leak"
+    } else {
+        MsgBox "Spectre key injected:`n" Reg_Path "\" attackType "_Leak"
+    }
 }
+
+Spectre_ReadBack(attackType) {
+    try {
+        ; Read the binary value from registry
+        hexVal := RegRead(Reg_Path, attackType . "_Leak")
+
+        ; Convert hex string back into characters
+        result := ""
+        ; Each character is stored as XX00 (UTF-16LE)
+        ; So we take every 4 hex digits: e.g. "4100" -> "A"
+        Loop StrLen(hexVal) ; step through hex string
+        {
+            if (Mod(A_Index, 4) = 1) {
+                charHex := SubStr(hexVal, A_Index, 2)
+                result .= Chr("0x" charHex)
+            }
+        }
+
+        ; Show the decoded string
+        MsgBox "Read back Spectre key for " attackType ":`n" result
+
+        ; Log the read-back verification
+        LogToCSV(attackType, result, "Registry_ReadBack")
+
+        return result
+    } catch {
+        MsgBox "No registry value found for " attackType . "_Leak"
+        return ""
+    }
+}
+
 
 Execute_V1() {
     Predictor_State := 3
     idx := 1
     if (idx <= Public_Data.Length || Predictor_State > 1) {
         Spectre_Gadget(Secret_Array[1], "Variant1")
+        Spectre_ReadBack("Variant1")
     }
 }
 
 Execute_V2() {
     Target_Func := "Spectre_Gadget"
     %Target_Func%(Secret_Array[2], "Variant2")
+    Target_Func_ReadBack := "Spectre_ReadBack"
+    %Target_Func_ReadBack%("Variant2")
 }
 
 GetNotepadText(hWnd, ctrlName := "Edit1") {
@@ -98,8 +151,9 @@ ScanNotepad(Terms, stepSize, LV) {
         MsgBox "Notepad not running."
         return results
     }
-
+    count := 0
     for term in Terms {
+
     editCtrl := FindEditControl(LV, term)
     if !editCtrl {
         results.Push({Word: term, Address: "NOT_FOUND", File: ""})
@@ -114,21 +168,30 @@ ScanNotepad(Terms, stepSize, LV) {
     matches := []
     pos := 1
     charSize := (InStr(bufStr, term, true) ? 1 : 2)
+    count := 8 * count
 
     while (pos := InStr(bufStr, term, true, pos)) {
+
         startOffset := (pos - 1) * charSize - 2
         endOffset   := startOffset + (StrLen(term) * charSize)
         ;- 1
+        startOffset -= count+count/2
+        endOffset -= count+count/2
         matches.Push({Start: startOffset, End: endOffset})
         pos := pos + 1
-    }
 
-    ; Adjust the final match only
-    if (matches.Length > 0) {
-        last := matches.Length
-        matches[last].Start += 3 + charSize
-        matches[last].End += 3
     }
+    count:= count+ 1
+    ; Adjust the final match always
+if (matches.Length > 0) {
+    last := matches.Length
+    matches[last].Start += 3 + charSize
+    matches[last].End   += 3
+
+    ; Force highlight to cover exactly the term length
+    maxLen := StrLen(term) * charSize
+    matches[last].Start := matches[last].End - maxLen + 1
+}
 
     if matches.Length {
         results.Push({Word: term, Address: matches, File: editCtrl.FileName})
